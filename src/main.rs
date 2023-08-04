@@ -49,7 +49,7 @@ async fn main() -> Result<(), S3Error> {
             ServiceBuilder::new()
                 .layer(DefaultBodyLimit::disable())
                 .layer(RequestBodyLimitLayer::new(
-                    250 * 1024 * 1024, /* 250mb */
+                    2 * 1024 * 1024 * 1024, /* 2GiBs */
                 ))
                 .layer(tower_http::trace::TraceLayer::new_for_http())
                 .layer(Extension(Arc::new(AppState {
