@@ -1,4 +1,5 @@
 use axum::{
+    body::Body,
     http::{Request, StatusCode},
     middleware::Next,
     response::Response,
@@ -6,7 +7,7 @@ use axum::{
 use chrono::{Datelike, Timelike, Utc};
 use colored::{ColoredString, Colorize};
 
-pub async fn request_logger<T>(request: Request<T>, next: Next<T>) -> Result<Response, StatusCode> {
+pub async fn request_logger(request: Request<Body>, next: Next) -> Result<Response, StatusCode> {
     let uri = request.uri().to_string();
     let response = next.run(request).await;
     let now = Utc::now();

@@ -5,7 +5,7 @@ use sha2::Sha256;
 use std::collections::BTreeMap;
 
 pub fn get_env_value(name: &str) -> String {
-    std::env::var(name).unwrap()
+    std::env::var(name).expect(&format!("Env variable {} should exist", name))
 }
 
 pub fn get_file_extension(filename: &str) -> String {

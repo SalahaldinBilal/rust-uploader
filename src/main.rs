@@ -1,15 +1,17 @@
 mod helpers;
+mod macros;
 mod middleware;
 mod routes;
 
 use axum::routing::get;
 use axum::Extension;
 use axum::{extract::DefaultBodyLimit, middleware::from_fn, routing::post, Router};
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use helpers::get_env_value;
 // use middlewares;
 use s3::{creds::Credentials, error::S3Error, Bucket};
 use std::{net::SocketAddr, sync::Arc};
+use tokio::net::TcpListener;
 use tower::ServiceBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -18,7 +20,7 @@ use crate::routes::{delete::delete_file_from_b2, upload::write_file_to_b2};
 
 #[derive(Clone)]
 pub struct AppState {
-    bucket_connection: Bucket,
+    bucket_connection: Box<Bucket>,
 }
 
 #[tokio::main]
@@ -59,10 +61,10 @@ async fn main() -> Result<(), S3Error> {
 
     let address = SocketAddr::from(([0, 0, 0, 0], 3000));
     println!("Server running at {}", address);
-    axum::Server::bind(&address)
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+
+    let listener = TcpListener::bind(address).await.expect("valid listener");
+
+    axum::serve(listener, app).await.unwrap();
 
     Ok(())
 }
