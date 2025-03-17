@@ -1,8 +1,19 @@
+use axum::body::BodyDataStream;
+use axum::body::Bytes;
+use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use jwt::SignWithKey;
 use jwt::VerifyWithKey;
 use sha2::Sha256;
 use std::collections::BTreeMap;
+use std::io;
+use std::io::SeekFrom;
+use std::pin::Pin;
+use std::task::Context;
+use std::task::Poll;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncSeek;
+use tokio::io::ReadBuf;
 
 pub fn get_env_value(name: &str) -> String {
     std::env::var(name).expect(&format!("Env variable {} should exist", name))
@@ -27,4 +38,109 @@ pub fn verify_jwt_token(secret: &str, token: &str) -> Result<BTreeMap<String, St
     let key: Hmac<Sha256> = Hmac::new_from_slice(&secret.as_bytes()).unwrap();
     let claims: Result<BTreeMap<String, String>, jwt::Error> = token.verify_with_key(&key);
     claims
+}
+
+pub struct AxumBodyStreamWrapper {
+    stream: BodyDataStream,
+    buffer: Bytes,
+    position: u64,
+    stream_position: u64,
+    seek_target: Option<u64>,
+}
+
+unsafe impl Sync for AxumBodyStreamWrapper {}
+unsafe impl Send for AxumBodyStreamWrapper {}
+
+impl AxumBodyStreamWrapper {
+    pub fn new(stream: BodyDataStream) -> Self {
+        Self {
+            stream,
+            buffer: Bytes::new(),
+            position: 0,
+            stream_position: 0,
+            seek_target: None,
+        }
+    }
+}
+
+impl AsyncRead for AxumBodyStreamWrapper {
+    // ... (poll_read implementation remains the same as in the previous corrected version)
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.position >= self.stream_position {
+            match self.stream.poll_next_unpin(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    self.buffer = chunk;
+                    self.position = self.stream_position;
+                    self.stream_position += self.buffer.len() as u64;
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("body stream error: {:?}", e),
+                    )));
+                }
+                Poll::Ready(None) => {
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        if self.position >= self.stream_position {
+            return Poll::Ready(Ok(())); // Stream is exhausted.
+        }
+
+        let start = (self.position - (self.stream_position - self.buffer.len() as u64)) as usize;
+        let end = std::cmp::min(self.buffer.len(), start + buf.remaining());
+        let to_read = end - start;
+        if start < self.buffer.len() {
+            buf.put_slice(&self.buffer[start..end]);
+            self.position += to_read as u64;
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+impl AsyncSeek for AxumBodyStreamWrapper {
+    fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        match position {
+            SeekFrom::Start(offset) => {
+                self.seek_target = Some(offset);
+            }
+            SeekFrom::Current(offset) => {
+                let new_pos = (self.position as i64).saturating_add(offset);
+                if new_pos < 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Seeking before start of stream",
+                    ));
+                }
+                self.seek_target = Some(new_pos as u64);
+            }
+            SeekFrom::End(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Seeking from end is not supported for streams",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_complete(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        if let Some(target) = self.seek_target.take() {
+            self.position = target;
+            if self.position < self.stream_position - self.buffer.len() as u64 {
+                self.buffer = Bytes::new();
+                self.stream_position = self.position;
+            }
+            Poll::Ready(Ok(self.position))
+        } else {
+            Poll::Pending // No seek operation started.
+        }
+    }
 }

@@ -1,125 +1,96 @@
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::{
-    extract::Multipart,
-    http::StatusCode,
-    response::{Json, Response},
     Extension,
+    body::Body,
+    extract::Path,
+    http::{Request, StatusCode},
+    response::Json,
 };
-use rand::distributions::{Alphanumeric, DistString};
-use serde_json::{json, Value};
+use rand::distr::{Alphanumeric, SampleString};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 use crate::{
-    helpers::{create_jwt_token, get_env_value, get_file_extension},
-    simple_response, AppState,
+    AppState,
+    helpers::{AxumBodyStreamWrapper, create_jwt_token, get_env_value, get_file_extension},
 };
 
+#[axum::debug_handler]
 pub async fn write_file_to_b2(
     Extension(state): Extension<Arc<AppState>>,
-    mut multipart: Multipart,
+    Path(file_name): Path<String>,
+    request: Request<Body>,
 ) -> (StatusCode, Json<Value>) {
-    let rand_id = Alphanumeric.sample_string(&mut rand::thread_rng(), 10);
-    let field_option = match multipart.next_field().await {
-        Ok(field) => field,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "success": false, "err": "Need at least one file" })),
-            )
-        }
-    };
+    let rand_id = Alphanumeric.sample_string(&mut rand::rng(), 10);
 
-    let field = match field_option {
-        Some(field) => field,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "success": false, "err": "Need at least one file" })),
-            )
-        }
-    };
-
-    let field_name = match field.name() {
-        Some(name) => name,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "success": false, "err": "Can't find file with key 'file'" })),
-            )
-        }
-    };
-
-    if field_name != "file" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "success": false, "err": "Can't find file with key 'file'" })),
-        );
-    }
-
-    let file_name = match field.file_name() {
-        Some(name) => name,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "success": false, "err": "'file' needs to have a name" })),
-            )
-        }
-    };
-
-    let file_mimetype = match field.content_type() {
-        Some(name) => name.to_string(),
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    json!({ "success": false, "err": "'file' needs to have proper content type" }),
-                ),
-            )
-        }
-    };
-
-    let file_extension = get_file_extension(file_name);
-    let temp_file_name = if file_extension.len() > 0 {
+    let file_extension = get_file_extension(&file_name);
+    let file_name = if file_extension.len() > 0 {
         format!("{rand_id}.{file_extension}")
     } else {
         rand_id
     };
 
-    let data = match field.bytes().await {
-        Ok(bytes) => bytes,
-        Err(err) => {
+    let file_size = match request.headers().get("content-length") {
+        Some(value) => match u64::from_str(String::from_utf8_lossy(value.as_bytes()).as_ref()) {
+            Ok(size) => size,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        json!({ "success": false, "err": format!("Failed to parse content length as number: {:#?}", err) }),
+                    ),
+                );
+            }
+        },
+        None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(
-                    json!({ "success": false, "err": format!("Failed to read file: {}", err.to_string()) }),
-                ),
-            )
+                Json(json!({ "success": false, "err": "Content Length header not specified." })),
+            );
         }
     };
 
-    let upload_result = state
-        .bucket_connection
-        .put_object_with_content_type(&temp_file_name, &data, &file_mimetype)
+    let body = request.into_body();
+
+    let stream = AxumBodyStreamWrapper::new(body.into_data_stream());
+
+    let upload = state
+        .b2_client
+        .create_upload(
+            stream,
+            file_name,
+            get_env_value("B2_BUCKET_ID"),
+            None,
+            file_size,
+            None,
+        )
         .await;
 
-    if let Err(err) = upload_result {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(
-                json!({ "success": false, "err": format!("Failed to upload file: {}", err.to_string()) }),
-            ),
-        );
-    }
+    let file_info = match upload.start().await {
+        Ok(file) => file,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({ "success": false, "err": format!("Failed to upload file: {:#?}", err) }),
+                ),
+            );
+        }
+    };
 
     let jwt_secret = get_env_value("JWT_SECRET");
     let token = create_jwt_token(
         &jwt_secret,
-        &BTreeMap::from([("filename", temp_file_name.as_str())]),
+        &BTreeMap::from([
+            ("filename", file_info.file_name.as_ref()),
+            ("file_id", file_info.file_id.as_ref()),
+        ]),
     )
     .expect("valid JWT token");
 
-    let url = format!("{}/{}", get_env_value("IMAGE_URL"), temp_file_name);
+    let url = format!("{}/{}", get_env_value("IMAGE_URL"), file_info.file_name);
 
     let deletion = format!("{}/delete?token_str={}", get_env_value("API_URL"), token);
 

@@ -3,13 +3,14 @@ mod macros;
 mod middleware;
 mod routes;
 
-use axum::routing::get;
 use axum::Extension;
-use axum::{extract::DefaultBodyLimit, middleware::from_fn, routing::post, Router};
+use axum::routing::get;
+use axum::{Router, extract::DefaultBodyLimit, middleware::from_fn, routing::post};
+use backblaze_b2_client::client::B2Client;
+use backblaze_b2_client::error::B2Error;
+use backblaze_b2_client::util::SizeUnit;
 use dotenvy::dotenv;
 use helpers::get_env_value;
-// use middlewares;
-use s3::{creds::Credentials, error::S3Error, Bucket};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 use tower::ServiceBuilder;
@@ -20,42 +21,37 @@ use crate::routes::{delete::delete_file_from_b2, upload::write_file_to_b2};
 
 #[derive(Clone)]
 pub struct AppState {
-    bucket_connection: Box<Bucket>,
+    b2_client: Arc<B2Client>,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), S3Error> {
+async fn main() -> Result<(), B2Error> {
     dotenv().ok();
 
-    let bucket = Bucket::new(
-        &get_env_value("B2_BUCKET_NAME"),
-        s3::Region::Custom {
-            region: get_env_value("B2_BUCKET_S3_REGION"),
-            endpoint: get_env_value("B2_BUCKET_S3_ENDPOINT"),
-        },
-        Credentials::new(
-            Some(&get_env_value("B2_KEY_ID")),
-            Some(&get_env_value("B2_APP_KEY")),
-            None,
-            None,
-            None,
-        )?,
-    )?;
+    let key_id = get_env_value("B2_KEY_ID");
+    let application_key = get_env_value("B2_APP_KEY");
+    get_env_value("B2_BUCKET_ID");
+    get_env_value("JWT_SECRET");
+    get_env_value("API_URL");
+    get_env_value("KEY");
+    get_env_value("IMAGE_URL");
+
+    let client = B2Client::new(key_id, application_key).await?;
 
     let app = Router::new()
         .route("/delete", get(delete_file_from_b2))
-        .route("/upload", post(write_file_to_b2))
+        .route("/upload/{file_name}", post(write_file_to_b2))
         .route_layer(from_fn(key_guard))
         .route_layer(from_fn(request_logger))
         .layer(
             ServiceBuilder::new()
                 .layer(DefaultBodyLimit::disable())
                 .layer(RequestBodyLimitLayer::new(
-                    2 * 1024 * 1024 * 1024, /* 2GiBs */
+                    (SizeUnit::GIBIBYTE * 10) as usize,
                 ))
                 .layer(tower_http::trace::TraceLayer::new_for_http())
                 .layer(Extension(Arc::new(AppState {
-                    bucket_connection: bucket,
+                    b2_client: Arc::new(client),
                 }))),
         );
 

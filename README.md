@@ -1,13 +1,13 @@
 # Rust file uploader
 
-A simple API built with rust that is used to upload/delete uploaded files from S3 or S3 compatible storage.
+A simple API built with rust that is used to upload/delete uploaded files from Backblaze B2.
 
 ## Routes
 
 ### - `/upload` POST
 
 The file upload request.\
-Body must be of type `multipart/form-data`.\
+Body must be raw bytes of the file.\
 Must have have a header called `Key` and its value must be equal to the `KEY` env variable.
 
 On success
@@ -40,5 +40,3 @@ Returns
   "message": "error message or success message"
 }
 ```
-
-### This is my first ever rust project, so might rough around the edges in some places.
