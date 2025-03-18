@@ -1,5 +1,4 @@
 use axum::body::BodyDataStream;
-use axum::body::Bytes;
 use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use jwt::SignWithKey;
@@ -14,6 +13,7 @@ use std::task::Poll;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncSeek;
 use tokio::io::ReadBuf;
+use tokio_util::bytes::BytesMut;
 
 pub fn get_env_value(name: &str) -> String {
     std::env::var(name).expect(&format!("Env variable {} should exist", name))
@@ -42,10 +42,11 @@ pub fn verify_jwt_token(secret: &str, token: &str) -> Result<BTreeMap<String, St
 
 pub struct AxumBodyStreamWrapper {
     stream: BodyDataStream,
-    buffer: Bytes,
+    buffer: BytesMut,
     position: u64,
     stream_position: u64,
     seek_target: Option<u64>,
+    seeking: bool,
 }
 
 unsafe impl Sync for AxumBodyStreamWrapper {}
@@ -55,16 +56,16 @@ impl AxumBodyStreamWrapper {
     pub fn new(stream: BodyDataStream) -> Self {
         Self {
             stream,
-            buffer: Bytes::new(),
+            buffer: BytesMut::new(),
             position: 0,
             stream_position: 0,
             seek_target: None,
+            seeking: false,
         }
     }
 }
 
 impl AsyncRead for AxumBodyStreamWrapper {
-    // ... (poll_read implementation remains the same as in the previous corrected version)
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -73,9 +74,9 @@ impl AsyncRead for AxumBodyStreamWrapper {
         if self.position >= self.stream_position {
             match self.stream.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
-                    self.buffer = chunk;
                     self.position = self.stream_position;
-                    self.stream_position += self.buffer.len() as u64;
+                    self.stream_position += chunk.len() as u64;
+                    self.buffer.extend(chunk);
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Err(io::Error::new(
@@ -91,12 +92,13 @@ impl AsyncRead for AxumBodyStreamWrapper {
         }
 
         if self.position >= self.stream_position {
-            return Poll::Ready(Ok(())); // Stream is exhausted.
+            return Poll::Ready(Ok(()));
         }
 
         let start = (self.position - (self.stream_position - self.buffer.len() as u64)) as usize;
         let end = std::cmp::min(self.buffer.len(), start + buf.remaining());
         let to_read = end - start;
+
         if start < self.buffer.len() {
             buf.put_slice(&self.buffer[start..end]);
             self.position += to_read as u64;
@@ -134,13 +136,19 @@ impl AsyncSeek for AxumBodyStreamWrapper {
     fn poll_complete(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
         if let Some(target) = self.seek_target.take() {
             self.position = target;
-            if self.position < self.stream_position - self.buffer.len() as u64 {
-                self.buffer = Bytes::new();
-                self.stream_position = self.position;
-            }
             Poll::Ready(Ok(self.position))
         } else {
-            Poll::Pending // No seek operation started.
+            match (self.seeking, self.seek_target.is_some()) {
+                (true, true) => Poll::Pending,
+                (true, false) => {
+                    self.seeking = false;
+                    Poll::Ready(Ok(self.position))
+                }
+                _ => {
+                    self.seeking = true;
+                    Poll::Ready(Ok(self.position))
+                }
+            }
         }
     }
 }
