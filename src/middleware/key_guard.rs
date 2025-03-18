@@ -12,8 +12,12 @@ pub async fn key_guard(request: Request<Body>, next: Next) -> Result<Response, S
         return Ok(next.run(request).await);
     }
 
-    let key = request.headers().get("Key").ok_or(StatusCode::BAD_REQUEST);
-    let key = key.unwrap().to_str().unwrap();
+    let key = request
+        .headers()
+        .get("Key")
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    let key = key.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
 
     if get_env_value("KEY") == key {
         return Ok(next.run(request).await);
